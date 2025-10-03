@@ -1,4 +1,4 @@
 discord.py-self
 python-dotenv
 pynacl
-audioop
+audioop-lts

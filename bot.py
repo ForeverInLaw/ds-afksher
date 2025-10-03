@@ -26,12 +26,13 @@ async def clear_activity():
     except Exception as e:
         logger.error(f'❌ Ошибка при очистке активности: {e}')
 
-async def connect_to_voice_channel(channel, retry_count=0, max_retries=5):
+async def connect_to_voice_channel(channel, retry_count=0, max_retries=10):
     """Подключается к голосовому каналу с повторными попытками"""
     global voice_client
     
     if retry_count >= max_retries:
         logger.error(f'❌ Достигнуто максимальное количество попыток подключения ({max_retries})')
+        logger.warning('⚠️ Возможно, Discord блокирует voice подключения для selfbot')
         return None
     
     try:
@@ -42,9 +43,11 @@ async def connect_to_voice_channel(channel, retry_count=0, max_retries=5):
             
             logger.info('🔄 Отключаюсь от старого voice соединения...')
             await voice_client.disconnect(force=True)
-            await asyncio.sleep(1)
+            await asyncio.sleep(2)
         
-        voice_client = await channel.connect(timeout=30.0, reconnect=True)
+        await asyncio.sleep(retry_count * 2)
+        
+        voice_client = await channel.connect(timeout=60.0, reconnect=False, self_deaf=True, self_mute=False)
         logger.info(f'✅ Успешно подключился к голосовому каналу: {channel.name}')
         return voice_client
         
@@ -58,6 +61,20 @@ async def connect_to_voice_channel(channel, retry_count=0, max_retries=5):
         logger.info(f'⏳ Повтор через {wait_time} секунд...')
         await asyncio.sleep(wait_time)
         return await connect_to_voice_channel(channel, retry_count + 1, max_retries)
+    
+    except discord.errors.ConnectionClosed as e:
+        if e.code == 4006:
+            wait_time = min(3 ** retry_count, 120)
+            logger.warning(f'⚠️ Voice session invalid (4006), попытка {retry_count + 1}/{max_retries}')
+            logger.info(f'⏳ Ожидание {wait_time} секунд перед повтором...')
+            await asyncio.sleep(wait_time)
+            return await connect_to_voice_channel(channel, retry_count + 1, max_retries)
+        else:
+            wait_time = min(2 ** retry_count, 60)
+            logger.error(f'❌ Voice WebSocket закрыт с кодом {e.code} (попытка {retry_count + 1}/{max_retries})')
+            logger.info(f'⏳ Повтор через {wait_time} секунд...')
+            await asyncio.sleep(wait_time)
+            return await connect_to_voice_channel(channel, retry_count + 1, max_retries)
         
     except Exception as e:
         wait_time = min(2 ** retry_count, 60)
@@ -226,7 +243,9 @@ async def on_ready():
                 logger.info(f'📝 Тип канала: {type(channel).__name__}')
                 
                 if isinstance(channel, discord.VoiceChannel):
-                    logger.info('🎤 Это голосовой канал - подключаюсь...')
+                    logger.info('🎤 Это голосовой канал - пытаюсь подключиться...')
+                    logger.warning('⚠️ Voice подключения для selfbot могут быть ограничены Discord')
+                    
                     voice_client = await connect_to_voice_channel(channel)
                     
                     if voice_client:
@@ -235,6 +254,9 @@ async def on_ready():
                         if reconnect_task is None or reconnect_task.done():
                             reconnect_task = client.loop.create_task(monitor_voice_connection())
                             logger.info('🔄 Запущен мониторинг voice соединения')
+                    else:
+                        logger.warning('⚠️ Не удалось подключиться к voice каналу')
+                        logger.info('ℹ️ Бот продолжит работу без voice подключения')
                     
                     client.loop.create_task(update_activity())
                     logger.info('⏰ Запущен таймер обновления активности')

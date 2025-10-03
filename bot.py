@@ -36,6 +36,10 @@ async def connect_to_voice_channel(channel, retry_count=0, max_retries=5):
     
     try:
         if voice_client and voice_client.is_connected():
+            if voice_client.channel.id == channel.id:
+                logger.debug('🔗 Уже подключен к этому каналу')
+                return voice_client
+            
             logger.info('🔄 Отключаюсь от старого voice соединения...')
             await voice_client.disconnect(force=True)
             await asyncio.sleep(1)
@@ -45,6 +49,10 @@ async def connect_to_voice_channel(channel, retry_count=0, max_retries=5):
         return voice_client
         
     except discord.ClientException as e:
+        if "Already connected" in str(e):
+            logger.debug('ℹ️ Уже подключен к voice каналу')
+            return voice_client
+        
         wait_time = min(2 ** retry_count, 60)
         logger.warning(f'⚠️ Ошибка подключения (попытка {retry_count + 1}/{max_retries}): {e}')
         logger.info(f'⏳ Повтор через {wait_time} секунд...')
@@ -67,9 +75,18 @@ async def monitor_voice_connection():
     if not target_channel_id:
         return
     
+    await asyncio.sleep(5)
+    
     while not client.is_closed():
         try:
-            if voice_client is None or not voice_client.is_connected():
+            should_reconnect = False
+            
+            if voice_client is None:
+                should_reconnect = True
+            elif not voice_client.is_connected():
+                should_reconnect = True
+            
+            if should_reconnect:
                 logger.warning('⚠️ Voice соединение потеряно. Переподключаюсь...')
                 
                 channel = client.get_channel(target_channel_id)

@@ -11,13 +11,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-intents = discord.Intents.default()
-intents.guilds = True
-intents.voice_states = True
-intents.presences = True
-intents.message_content = True
-
-client = discord.Client(intents=intents)
+client = discord.Client()
 start_time = None
 voice_client = None
 reconnect_task = None

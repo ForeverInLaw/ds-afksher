@@ -11,16 +11,86 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-client = discord.Client()
+intents = discord.Intents.default()
+intents.guilds = True
+intents.voice_states = True
+intents.presences = True
+intents.message_content = True
+
+client = discord.Client(intents=intents)
 start_time = None
+voice_client = None
+reconnect_task = None
+target_channel_id = CHANNEL_ID
 
 async def clear_activity():
     """Очищает активность (статус)"""
     try:
-        await client.change_presence(activity=None)
-        logger.info(f'✅ Активность очищена')
+        if client.is_ready() and not client.is_closed():
+            await client.change_presence(activity=None)
+            logger.info(f'✅ Активность очищена')
     except Exception as e:
         logger.error(f'❌ Ошибка при очистке активности: {e}')
+
+async def connect_to_voice_channel(channel, retry_count=0, max_retries=5):
+    """Подключается к голосовому каналу с повторными попытками"""
+    global voice_client
+    
+    if retry_count >= max_retries:
+        logger.error(f'❌ Достигнуто максимальное количество попыток подключения ({max_retries})')
+        return None
+    
+    try:
+        if voice_client and voice_client.is_connected():
+            logger.info('🔄 Отключаюсь от старого voice соединения...')
+            await voice_client.disconnect(force=True)
+            await asyncio.sleep(1)
+        
+        voice_client = await channel.connect(timeout=30.0, reconnect=True)
+        logger.info(f'✅ Успешно подключился к голосовому каналу: {channel.name}')
+        return voice_client
+        
+    except discord.ClientException as e:
+        wait_time = min(2 ** retry_count, 60)
+        logger.warning(f'⚠️ Ошибка подключения (попытка {retry_count + 1}/{max_retries}): {e}')
+        logger.info(f'⏳ Повтор через {wait_time} секунд...')
+        await asyncio.sleep(wait_time)
+        return await connect_to_voice_channel(channel, retry_count + 1, max_retries)
+        
+    except Exception as e:
+        wait_time = min(2 ** retry_count, 60)
+        logger.error(f'❌ Неожиданная ошибка при подключении (попытка {retry_count + 1}/{max_retries}): {e}')
+        logger.info(f'⏳ Повтор через {wait_time} секунд...')
+        await asyncio.sleep(wait_time)
+        return await connect_to_voice_channel(channel, retry_count + 1, max_retries)
+
+async def monitor_voice_connection():
+    """Мониторит voice соединение и переподключается при разрыве"""
+    global voice_client
+    
+    await client.wait_until_ready()
+    
+    if not target_channel_id:
+        return
+    
+    while not client.is_closed():
+        try:
+            if voice_client is None or not voice_client.is_connected():
+                logger.warning('⚠️ Voice соединение потеряно. Переподключаюсь...')
+                
+                channel = client.get_channel(target_channel_id)
+                if channel and isinstance(channel, discord.VoiceChannel):
+                    voice_client = await connect_to_voice_channel(channel)
+                    if voice_client:
+                        logger.info('✅ Voice соединение восстановлено')
+                else:
+                    logger.error(f'❌ Не могу найти voice канал с ID {target_channel_id}')
+            
+            await asyncio.sleep(30)
+            
+        except Exception as e:
+            logger.error(f'❌ Ошибка в мониторе voice соединения: {e}')
+            await asyncio.sleep(30)
 
 def format_time(minutes):
     """Форматирует время в читаемый формат"""
@@ -54,7 +124,7 @@ async def on_connect():
 @client.event
 async def on_disconnect():
     logger.warning('❌ Отключено от Discord WebSocket')
-    await clear_activity()
+    await asyncio.sleep(1)
 
 def get_activity_type():
     """Возвращает тип активности Discord по строковому значению"""
@@ -88,31 +158,30 @@ async def update_activity():
     
     while not client.is_closed():
         try:
+            if not client.is_ready() or client.is_closed():
+                logger.debug('⏸️ Клиент не готов, пропускаю обновление активности')
+                await asyncio.sleep(10)
+                continue
+            
             elapsed = datetime.now() - start_time
             minutes = int(elapsed.total_seconds() / 60)
             
             time_str = format_time(minutes)
             activity_text = f"афкшу уже {time_str}"
             
-            # Для пользовательских аккаунтов используем разные типы активностей
             if ACTIVITY_TYPE == 'playing':
-                # Используем Game для "Играет в..."
                 activity = discord.Game(name=activity_text)
                 logger.info(f'✏️ Активность обновлена: Играет в "{activity_text}"')
             elif ACTIVITY_TYPE == 'streaming':
-                # Для стриминга нужен URL
                 activity = discord.Streaming(name=activity_text, url="https://twitch.tv/afk")
                 logger.info(f'✏️ Активность обновлена: Стримит "{activity_text}"')
             else:
-                # Для остальных типов используем Activity
                 activity_type = get_activity_type()
                 activity_prefix = get_activity_prefix()
                 activity = discord.Activity(type=activity_type, name=activity_text)
                 logger.info(f'✏️ Активность обновлена: {activity_prefix} "{activity_text}"')
             
             await client.change_presence(activity=activity)
-
-            
             await asyncio.sleep(60)
             
         except discord.HTTPException as e:
@@ -122,13 +191,16 @@ async def update_activity():
             else:
                 logger.error(f'❌ Ошибка HTTP при изменении активности: {e}')
                 await asyncio.sleep(60)
+        except discord.ConnectionClosed:
+            logger.warning('⚠️ Соединение закрыто, жду восстановления...')
+            await asyncio.sleep(30)
         except Exception as e:
             logger.error(f'❌ Ошибка при обновлении активности: {e}')
             await asyncio.sleep(60)
 
 @client.event
 async def on_ready():
-    global start_time
+    global start_time, voice_client, reconnect_task
     
     logger.info('=' * 50)
     logger.info(f'✅ Бот готов к работе!')
@@ -144,17 +216,18 @@ async def on_ready():
                 
                 if isinstance(channel, discord.VoiceChannel):
                     logger.info('🎤 Это голосовой канал - подключаюсь...')
-                    try:
-                        voice_client = await channel.connect()
-                        logger.info(f'✅ Успешно подключился к голосовому каналу: {channel.name}')
+                    voice_client = await connect_to_voice_channel(channel)
+                    
+                    if voice_client:
                         logger.info('🔊 Статус: В ГОЛОСОВОМ КАНАЛЕ')
                         
-                        client.loop.create_task(update_activity())
-                        logger.info('⏰ Запущен таймер обновления активности')
-                    except discord.ClientException as e:
-                        logger.error(f'❌ Ошибка подключения к голосовому каналу: {e}')
-                    except Exception as e:
-                        logger.error(f'❌ Неожиданная ошибка при подключении: {e}')
+                        if reconnect_task is None or reconnect_task.done():
+                            reconnect_task = client.loop.create_task(monitor_voice_connection())
+                            logger.info('🔄 Запущен мониторинг voice соединения')
+                    
+                    client.loop.create_task(update_activity())
+                    logger.info('⏰ Запущен таймер обновления активности')
+                    
                 elif isinstance(channel, discord.TextChannel):
                     logger.info('💬 Это текстовый канал - бот будет онлайн')
                     client.loop.create_task(update_activity())
@@ -182,6 +255,29 @@ async def on_resumed():
 async def on_error(event, *args, **kwargs):
     logger.error(f'❌ Ошибка в событии {event}', exc_info=True)
 
+async def cleanup():
+    """Очистка ресурсов перед завершением"""
+    global voice_client, reconnect_task
+    
+    logger.info('🔄 Начинаю очистку...')
+    
+    if reconnect_task and not reconnect_task.done():
+        reconnect_task.cancel()
+        logger.info('✅ Мониторинг voice соединения остановлен')
+    
+    if voice_client and voice_client.is_connected():
+        try:
+            await voice_client.disconnect(force=True)
+            logger.info('✅ Отключен от voice канала')
+        except Exception as e:
+            logger.error(f'❌ Ошибка при отключении от voice: {e}')
+    
+    await clear_activity()
+    
+    if not client.is_closed():
+        await client.close()
+        logger.info('✅ Соединение с Discord закрыто')
+
 async def main():
     logger.info('🚀 Запуск Discord Userbot...')
     logger.info('⚠️ ПРЕДУПРЕЖДЕНИЕ: Использование userbot нарушает ToS Discord!')
@@ -195,10 +291,7 @@ async def main():
     except Exception as e:
         logger.error(f'❌ Неожиданная ошибка: {e}', exc_info=True)
     finally:
-        logger.info('🔄 Очищаю активность...')
-        await clear_activity()
-        if not client.is_closed():
-            await client.close()
+        await cleanup()
 
 if __name__ == '__main__':
     try:
